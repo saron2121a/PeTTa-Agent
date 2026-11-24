@@ -11,7 +11,7 @@ env/
 .env.*
 !.env.example
 
-# SQLite databases
+# SQLite databases (local runtime data)
 *.db
 *.db-journal
 *.db-shm
@@ -22,6 +22,7 @@ agent_workspace/
 
 # Local logs and temporary files
 *.log
+# Temporary files
 *.tmp
 *.bak
 .DS_Store
@@ -29,3 +30,6 @@ Thumbs.db
 
 # Benchmark output
 benchmark_results.md
+
+# SQLite database backups
+*.db.*

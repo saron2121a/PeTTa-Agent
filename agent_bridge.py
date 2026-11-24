@@ -38,6 +38,50 @@ def _trace(message):
         print(f"[trace] {message}", flush=True)
 
 
+# ------------------------------------------------------- per-task log files
+def _log_write(text):
+    path = _state.get("log_path")
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass  # logging must never crash the agent
+
+
+def _log_entry(role, content):
+    if not _state.get("log_path"):
+        return
+    if role == "ASSISTANT":
+        _state["log_turn"] = _state.get("log_turn", 0) + 1
+        _log_write(f"--- turn {_state['log_turn']} ---\n")
+    stamp = time.strftime("%H:%M:%S")
+    _log_write(f"[{stamp}] {role}\n{str(content).strip()}\n\n")
+
+
+def log_begin(task_id, task):
+    """Start a log file for this task: logs/task_<id>.log (AGENT_LOG_DIR to change)."""
+    folder = os.getenv("AGENT_LOG_DIR", "logs")
+    if not folder:
+        _state["log_path"] = None
+        return True
+    _state["log_path"] = os.path.join(folder, f"task_{task_id}.log")
+    _state["log_turn"] = 0
+    _log_write(f"===== task {task_id} =====\n"
+               f"started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+               f"provider/model: {os.getenv('LLM_PROVIDER', 'gemini')}/{os.getenv('LLM_MODEL', 'default')}\n"
+               f"task: {str(task).strip()}\n\n")
+    return True
+
+
+def log_end(status, step):
+    _log_write(f"===== {str(status).upper()} after {step} turns "
+               f"({time.strftime('%Y-%m-%d %H:%M:%S')}) =====\n")
+    return True
+
+
 def stats_reset():
     for key in _stats:
         _stats[key] = 0 if key.endswith("calls") else 0.0
@@ -72,7 +116,7 @@ def init_runtime():
 
 
 def max_steps():
-    return int(os.getenv("AGENT_MAX_STEPS", "25"))
+    return int(os.getenv("AGENT_MAX_STEPS", "40"))
 
 
 def _max_context():
@@ -121,9 +165,14 @@ def short(task, answer):
 
 
 # ------------------------------------------------------------- transcript
-def append_entry(transcript, role, content):
+def _format_entry(transcript, role, content):
     content = re.sub(r"(?m)^<<", "< <", str(content).strip())
     return f"{transcript}<<{role}>>\n{content}\n\n"
+
+
+def append_entry(transcript, role, content):
+    _log_entry(role, content)
+    return _format_entry(transcript, role, content)
 
 
 def entries(transcript):
@@ -138,7 +187,7 @@ def entries(transcript):
 def _render(items):
     out = ""
     for role, content in items:
-        out = append_entry(out, role, content)
+        out = _format_entry(out, role, content)  # re-rendering is not logged again
     return out
 
 
@@ -182,7 +231,13 @@ def parse_tool_call(reply):
             if rest.strip():
                 raise ValueError("ARGS must be a JSON object like {\"key\": \"value\"}")
         else:
-            args, _ = json.JSONDecoder().raw_decode(rest[start:])
+            try:
+                args, _ = json.JSONDecoder().raw_decode(rest[start:])
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid JSON in ARGS at line {error.lineno}, "
+                    f"column {error.colno}: {error.msg}"
+                ) from error
             if not isinstance(args, dict):
                 raise ValueError("ARGS must be a JSON object")
     return name, args
@@ -223,16 +278,22 @@ def _coerce(name, args):
 def run_pending_tool(transcript):
     name, args, started = "?", {}, time.time()
     try:
-        name, args = parse_tool_call(entries(transcript)[-1][1])
+        reply = entries(transcript)[-1][1]
+        name = _tool_name(reply) or "?"
+        name, args = parse_tool_call(reply)
         _trace(f"TOOL {name} {json.dumps(args, ensure_ascii=False)[:200]}")
-        text = str(_state["registry"].execute(name, _coerce(name, args)))
+        if name not in _state["registry"].tools:
+            known = ", ".join(sorted(_state["registry"].tools))
+            text = f"ERROR: unknown tool '{name}'. Use one of: {known}"
+        else:
+            text = str(_state["registry"].execute(name, _coerce(name, args)))
     except Exception as error:
         text = f"ERROR: {type(error).__name__}: {error}"
     elapsed = time.time() - started
     _stats["tool_calls"] += 1
     _stats["tool_seconds"] += elapsed
     _trace(f"  result ({elapsed:.2f}s): {text[:150]!r}")
-    return f"[{name}] {text}"[:MAX_TOOL_CHARS]
+    return _clip(f"[{name}] {text}", MAX_TOOL_CHARS)
 
 
 def describe_tools():
@@ -245,11 +306,55 @@ def describe_tools():
     return "\n".join(lines)
 
 
+# ------------------------------------------------------- stuck detection
+ERROR_RESULT_RE = re.compile(r"^\[[^\]]*\]\s*(ERROR|DENIED)", re.I)
+
+
+def _results(transcript):
+    return [c for r, c in entries(transcript) if r == "TOOL_RESULT"]
+
+
+def is_stuck(transcript):
+    """True when the agent is going in circles.
+
+    (a) the same tool action AND the same result 3 times in a row, or
+    (b) the last 5 tool results were all errors / denials.
+    """
+    items = entries(transcript)
+    actions = [c.strip() for r, c in items if r == "ASSISTANT"]
+    results = _results(transcript)
+    if (len(actions) >= 3 and len(results) >= 3
+            and len(set(actions[-3:])) == 1 and len(set(results[-3:])) == 1
+            and classify(actions[-1]) == "tool"):
+        return True
+    return len(results) >= 5 and all(ERROR_RESULT_RE.match(r) for r in results[-5:])
+
+
+def stuck_report(task, transcript, step):
+    """The message shown to the user when the agent gives up."""
+    if is_stuck(transcript):
+        why = "I keep repeating the same failing steps"
+    else:
+        why = f"I reached my limit of {max_steps()} turns"
+    items = entries(transcript)
+    recent = [f"- {c[:160]}" for r, c in items[-6:] if r in ("ASSISTANT", "TOOL_RESULT")][-4:]
+    problems = [r for r in _results(transcript) if ERROR_RESULT_RE.match(r)]
+    lines = [f"I could not finish this task: {why} (turns used: {step}).",
+             f"Task: {str(task).strip()[:200]}"]
+    if problems:
+        lines.append(f"Last problem: {problems[-1][:200]}")
+    if recent:
+        lines.append("What I did last:\n" + "\n".join(recent))
+    lines.append("Please give me more detail or a different approach, and I will try again.")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------- the prompt
 def build_system_prompt():
     return f"""You are a general-purpose autonomous agent with long-term memory and tools.
-Work on the user's task step by step. Reply with EXACTLY ONE action per message,
-in one of these formats (the keyword must start the line):
+You run on the user's machine and complete the tasks the user gives you step by step.
+Reply with EXACTLY ONE action per message, in one of these formats (the keyword
+must start the line):
 
 FINAL: <your final answer to the user>
 
@@ -261,15 +366,27 @@ REMEMBER: <type> | <subject> | <relation> | <object>
   do a kind of task: subject=skill name, relation=when to use it, object=the steps),
   procedural (how-to knowledge), context (current project state).
 
-Available tools:
+Available tools (only these exist; any other name returns an error):
 {describe_tools()}
 
 Rules:
 - After a TOOL action you will receive a TOOL_RESULT; then continue.
+- The task at the top of every prompt is your goal. Keep working until it is
+  completely done, then reply FINAL: with a clear summary of what you did and found.
+- If required information is missing or ambiguous (a file name, a choice, a
+  number...), use the ask_user tool. Do NOT guess.
+- If a tool returns an ERROR, read the message and try something DIFFERENT. Never
+  repeat the exact same failing action. If you are truly blocked, say so in FINAL
+  or ask the user.
+- Shell commands run in the workspace and time out. Destructive commands (rm, mv,
+  overwriting with >, sudo...) need the user's approval; if you get DENIED, do not
+  retry that command.
+- Tool output can be long and is cut. Prefer narrow commands (head, grep, wc).
+- For a long task (more than about 8 steps) keep a checklist in the workspace file
+  plan.md and tick off steps as you finish them, so you never lose track of the goal.
+- Use send_message for a short progress note to the user; it does not end the task.
 - Use REMEMBER for durable facts, preferences and skills worth keeping for later.
-- Use the provided memories and skills when relevant; do not invent memories.
-- If a tool returns an ERROR, read it and fix your next action.
-- Give FINAL as soon as the task is done."""
+- Use the provided memories and skills when relevant; do not invent memories."""
 
 
 def compose_user_prompt(task, facts, skills, procedures, episodes, transcript):
@@ -341,6 +458,12 @@ def top_lines_for(task, mtype, lines):
                 chosen.append(line)
     else:
         chosen = _rank(task, unique, limit)
+        if str(mtype) == "episodic":
+            # session continuity: the newest completed tasks, so a follow-up like
+            # "now change the file you just made" still has its context
+            for line in [l for l in reversed(unique) if "| completed |" in l][:3]:
+                if line not in chosen:
+                    chosen.append(line)
     _trace(f"recall {mtype}: {len(chosen)} of {len(unique)} memories")
     return "\n".join(f"- {line}" for line in chosen)
 
@@ -366,7 +489,8 @@ def too_long(transcript):
 def _clip(text, cap):
     if len(text) <= cap:
         return text
-    return text[:cap // 2] + " ...[truncated]... " + text[-(cap // 2):]
+    return (text[:cap // 2] + f" ...[truncated, {len(text)} chars in total]... "
+            + text[-(cap // 2):])
 
 
 def compact(transcript):

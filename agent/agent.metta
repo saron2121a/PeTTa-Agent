@@ -51,12 +51,14 @@
 ; --------------------------------------------------------- the main loop
 (= (agent-run $task)
    (let* (($tid (py-call (agent_bridge.new_task_id)))
+          ($_g  (py-call (agent_bridge.log_begin $tid $task)))
           ($t0  (py-call (agent_bridge.append_entry "" "USER" $task)))
           ($_c  (py-call (agent_bridge.save_checkpoint $tid $task $t0 0 "running"))))
      (agent-step $tid $task $t0 0)))
 
 (= (agent-resume $tid)
    (let* (($task (py-call (agent_bridge.cp_task $tid)))
+          ($_g   (py-call (agent_bridge.log_begin $tid $task)))
           ($tr   (py-call (agent_bridge.cp_transcript $tid)))
           ($step (py-call (agent_bridge.cp_step $tid))))
      (agent-step $tid $task $tr $step)))
@@ -67,7 +69,9 @@
    (if (< $step (max-steps))
        (if (py-call (agent_bridge.pending_tool $transcript))
            (agent-act $tid $task $transcript $step)
-           (agent-think $tid $task $transcript $step))
+           (if (py-call (agent_bridge.is_stuck $transcript))
+               (agent-give-up $tid $task $transcript $step)
+               (agent-think $tid $task $transcript $step)))
        (agent-give-up $tid $task $transcript $step)))
 
 (= (agent-think $tid $task $transcript $step)
@@ -117,6 +121,7 @@
 (= (agent-finish $tid $task $transcript $step $reply)
    (let* (($answer (py-call (agent_bridge.extract_final $reply)))
           ($_c (py-call (agent_bridge.save_checkpoint $tid $task $transcript $step "completed")))
+          ($_l (py-call (agent_bridge.log_end "completed" $step)))
           ($_m (remember "episodic"
                          (py-call (agent_bridge.task_label $tid))
                          "completed"
@@ -124,8 +129,9 @@
      $answer))
 
 (= (agent-give-up $tid $task $transcript $step)
-   (let* (($_c (py-call (agent_bridge.save_checkpoint $tid $task $transcript $step "failed"))))
-     "Maximum agent steps reached."))
+   (let* (($_c (py-call (agent_bridge.save_checkpoint $tid $task $transcript $step "failed")))
+          ($_l (py-call (agent_bridge.log_end "failed" $step))))
+     (py-call (agent_bridge.stuck_report $task $transcript $step))))
 
 ; LLM unreachable: leave the checkpoint 'running' so it resumes on next start.
 (= (agent-pause $reply)

@@ -8,9 +8,16 @@ import math
 import operator
 import os
 import re
+import signal
+import subprocess
 import time
 import urllib.parse
 import urllib.request
+
+from agent.tools.shell_safety import destructive_reason
+from agent.tools.userio import ConsoleIO
+
+SHELL_OUTPUT_CHARS = 3500
 
 _BIN = {
     ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
@@ -59,15 +66,38 @@ def _safe_path(workspace, path):
     return full
 
 
-def register_builtin_tools(registry, workspace="agent_workspace"):
+def _shell_timeout():
+    try:
+        return max(1.0, float(os.getenv("AGENT_SHELL_TIMEOUT", "30")))
+    except ValueError:
+        return 30.0
+
+
+def _clip_output(text, cap=SHELL_OUTPUT_CHARS):
+    if len(text) <= cap:
+        return text
+    return (text[:cap // 2] + f"\n...[output truncated, {len(text)} chars total]...\n"
+            + text[-(cap // 2):])
+
+
+def register_builtin_tools(registry, workspace="agent_workspace", io=None):
+    """Register every tool. `io` talks to the human (default: the terminal)."""
+    io = io or ConsoleIO()
     os.makedirs(workspace, exist_ok=True)
 
     def current_datetime():
         return datetime.datetime.now().strftime("%A %Y-%m-%d %H:%M:%S")
 
     def read_file(path):
-        with open(_safe_path(workspace, path), "r", encoding="utf-8") as f:
-            return f.read(20000)
+        full = _safe_path(workspace, path)
+        if not os.path.exists(full):
+            return (f"ERROR: file not found: {path}. "
+                    "Use list_files to see what exists, or check the spelling.")
+        if os.path.isdir(full):
+            return f"ERROR: {path} is a folder, not a file. Use list_files."
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(20000)
+        return text if text else "(the file is empty)"
 
     def write_file(path, content):
         full = _safe_path(workspace, path)
@@ -93,6 +123,56 @@ def register_builtin_tools(registry, workspace="agent_workspace"):
         text = re.sub(r"<[^>]+>", " ", text)
         return re.sub(r"\s+", " ", text).strip()[:6000]
 
+    def run_shell(command):
+        command = str(command).strip()
+        if not command:
+            return "ERROR: empty command"
+        reason = destructive_reason(command)
+        if reason:
+            allowed = io.confirm(f"The agent wants to run: {command}\n  Why it needs approval: {reason}")
+            if not allowed:
+                return ("DENIED: the user did not approve this command (" + reason + "). "
+                        "Do not retry it. Choose a safer way, or ask the user what to do.")
+        timeout = _shell_timeout()
+        try:
+            proc = subprocess.Popen(
+                command, shell=True, cwd=os.path.abspath(workspace),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, errors="replace",
+                start_new_session=True)
+        except Exception as error:
+            return f"ERROR: could not start the command: {type(error).__name__}: {error}"
+        try:
+            output, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            partial = ""
+            try:
+                partial = proc.communicate(timeout=5)[0] or ""
+            except Exception:
+                pass
+            return (f"ERROR: the command timed out after {timeout:g} seconds and was stopped."
+                    " Try a faster or smaller command.\n" + _clip_output(partial))
+        output = _clip_output(output or "")
+        if proc.returncode == 0:
+            return output if output.strip() else "(command finished with no output)"
+        return f"ERROR: the command failed with exit code {proc.returncode}.\n{output}"
+
+    def send_message(message):
+        io.say(str(message))
+        return "Message delivered to the user."
+
+    def ask_user(question):
+        answer = io.ask(str(question))
+        if answer is None:
+            return ("ERROR: no user is available to answer right now. "
+                    "State your assumption clearly in your final answer, or stop and explain what is missing.")
+        answer = answer.strip()
+        return answer if answer else "(the user gave an empty answer)"
+
     registry.register("calculator",
         "Evaluate a math expression (+ - * / // % **, sqrt, sin, log, pi...).",
         {"expression": {"description": "e.g. (5+3)*2", "type": str}}, calculate)
@@ -116,6 +196,18 @@ def register_builtin_tools(registry, workspace="agent_workspace"):
     registry.register("wait",
         "Pause for a number of seconds (max 120), e.g. to wait before a next step.",
         {"seconds": {"description": "how many seconds", "type": float}}, wait)
+    registry.register("run_shell",
+        "Run a shell command inside the agent workspace and return its output. "
+        "Has a timeout. Destructive commands (rm, mv, overwriting with >, sudo...) "
+        "need the user's approval first.",
+        {"command": {"description": "the shell command line", "type": str}}, run_shell)
+    registry.register("send_message",
+        "Show a message to the user (a progress note or result) without ending the task.",
+        {"message": {"description": "text to show the user", "type": str}}, send_message)
+    registry.register("ask_user",
+        "Ask the user a question and wait for the typed answer. Use it whenever "
+        "required information is missing instead of guessing.",
+        {"question": {"description": "the question for the user", "type": str}}, ask_user)
     registry.register("web_fetch",
         "Download a web page and return its text (first ~6000 characters).",
         {"url": {"description": "http(s) URL", "type": str}}, web_fetch)

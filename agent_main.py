@@ -24,7 +24,8 @@ def main(argv):
     if "--file" in argv:
         petta.load_metta_file(argv[argv.index("--file") + 1])
     elif "--task" in argv:
-        task = argv[argv.index("--task") + 1].replace('"', '\\"')
+        task = argv[argv.index("--task") + 1]
+        task = task.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
         result = petta.process_metta_string(f'!(agent-run "{task}")')
         print("\n".join(str(x) for x in result) if isinstance(result, list) else result)
     else:

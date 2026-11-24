@@ -323,3 +323,13 @@ def test_summary_has_no_marker_artifacts():
     assert "<<" not in seen["user"]          # the summariser never sees our markers
     assert b.summary_of(new) == "Did things"
     assert "< <" not in new
+
+
+def test_malformed_tool_json_reports_tool_name_and_clear_error():
+    t = b.append_entry(
+        "",
+        "ASSISTANT",
+        'TOOL: run_shell\nARGS: {"command": "python3 -c "import petta""}'
+    )
+    result = b.run_pending_tool(t)
+    assert result.startswith("[run_shell] ERROR: ValueError: Invalid JSON in ARGS")
