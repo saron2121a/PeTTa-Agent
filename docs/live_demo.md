@@ -74,15 +74,15 @@ The agent then accepted the `exit` command and printed:
 
 ## 4. Test summary
 
-| Capability | Observed result |
-|---|---|
-| Interactive CLI input | Passed |
-| Sequential file writing and reading | Passed |
-| Asking the user for missing details | Passed |
-| Continuing after receiving an answer | Passed |
-| Multiple tasks without restarting | Passed |
-| Use of episodic task history | Demonstrated |
-| Clean CLI exit | Passed |
+| Capability                           | Observed result |
+| ------------------------------------ | --------------- |
+| Interactive CLI input                | Passed          |
+| Sequential file writing and reading  | Passed          |
+| Asking the user for missing details  | Passed          |
+| Continuing after receiving an answer | Passed          |
+| Multiple tasks without restarting    | Passed          |
+| Use of episodic task history         | Demonstrated    |
+| Clean CLI exit                       | Passed          |
 
 ## 5. Presentation notes and limitations
 
